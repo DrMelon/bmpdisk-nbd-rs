@@ -1,4 +1,5 @@
 use bmp::*;
+use lazy_static::lazy_static;
 use nbdkit::*;
 use std::cell::RefCell;
 use std::sync::Mutex;
@@ -7,6 +8,21 @@ use std::sync::Mutex;
 struct BMPDisk {
     bmpdata: Mutex<RefCell<Image>>,
 }
+
+struct BMPConfig {
+    filename: String,
+    split_channels: bool,
+    dimensions: u32,
+}
+
+lazy_static! {
+    static ref CONFIG: Mutex<BMPConfig> = Mutex::new(BMPConfig {
+        filename: "/var/tmp/bmpdisk.bmp".to_string(),
+        dimensions: 4096,
+        split_channels: true
+    });
+}
+
 pub fn onedee(x: u32, y: u32, width: u32) -> u64 {
     (x + (y * width)) as u64
 }
@@ -27,30 +43,36 @@ impl Server for BMPDisk {
     where
         Self: Sized,
     {
-        println!("Thread Model accessed.");
         Ok(ThreadModel::SerializeAllRequests)
     }
 
     fn get_size(&self) -> Result<i64> {
-        println!("Size requested.");
         let width = self.bmpdata.lock().unwrap().borrow().get_width();
         let height = self.bmpdata.lock().unwrap().borrow().get_height();
-        Ok((width * height) as i64)
+
+        let size = if CONFIG.lock().unwrap().split_channels {
+            width * height * 3
+        } else {
+            width * height
+        };
+        Ok(size as i64)
     }
 
     fn open(_readonly: bool) -> Box<dyn Server>
     where
         Self: Sized,
     {
-        println!("Plugin opened.");
         // Check to see if there is an existing bmp image file on disk.
-        if std::path::Path::exists(std::path::Path::new("/var/tmp/bmpdisk.bmp")) {
+        if std::path::Path::exists(std::path::Path::new(&CONFIG.lock().unwrap().filename[..])) {
             Box::new(BMPDisk {
-                bmpdata: Mutex::new(RefCell::new(bmp::open("/var/tmp/bmpdisk.bmp").unwrap())),
+                bmpdata: Mutex::new(RefCell::new(
+                    bmp::open(CONFIG.lock().unwrap().filename.to_string()).unwrap(),
+                )),
             })
         } else {
+            let dimensions = CONFIG.lock().unwrap().dimensions;
             Box::new(BMPDisk {
-                bmpdata: Mutex::new(RefCell::new(Image::new(4096, 4096))),
+                bmpdata: Mutex::new(RefCell::new(Image::new(dimensions, dimensions))),
             })
         }
     }
@@ -58,56 +80,104 @@ impl Server for BMPDisk {
     // OPTIMIZATION: Split across the 3 channels.
 
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
-        println!("Read!");
         let width = self.bmpdata.lock().unwrap().borrow().get_width();
         let buf_len = buf.len();
 
-        for idx in 0..buf_len {
-            let (px, py) = twodee(idx as u64 + offset, width);
-            buf[idx] = self.bmpdata.lock().unwrap().borrow().get_pixel(px, py).r;
+        if !CONFIG.lock().unwrap().split_channels {
+            for idx in 0..buf_len {
+                let (px, py) = twodee(idx as u64 + offset, width);
+                buf[idx] = self.bmpdata.lock().unwrap().borrow().get_pixel(px, py).r;
+            }
+        } else {
+            for idx in 0..buf_len {
+                let adjusted_idx = idx as u64 + offset;
+                let total_dimensions = width * width;
+                let page = adjusted_idx / total_dimensions as u64;
+                let normalized_idx = adjusted_idx % total_dimensions as u64;
+                let (px, py) = twodee(normalized_idx, width);
+                let pixel = self.bmpdata.lock().unwrap().borrow().get_pixel(px, py);
+                buf[idx] = match page {
+                    0 => pixel.r,
+                    1 => pixel.g,
+                    2 => pixel.b,
+                    _ => panic!("Page index out of range!"),
+                }
+            }
         }
 
         Ok(())
     }
 
     fn write_at(&self, buf: &[u8], offset: u64, _flags: Flags) -> Result<()> {
-        println!("Write!");
         let width = self.bmpdata.lock().unwrap().borrow().get_width();
         let buf_len = buf.len();
 
-        for idx in 0..buf_len {
-            let (px, py) = twodee(idx as u64 + offset, width);
-            let pxdata = Pixel {
-                r: buf[idx],
-                g: buf[idx],
-                b: buf[idx],
-            };
-            self.bmpdata
-                .lock()
-                .unwrap()
-                .borrow_mut()
-                .set_pixel(px, py, pxdata);
+        if !CONFIG.lock().unwrap().split_channels {
+            for idx in 0..buf_len {
+                let (px, py) = twodee(idx as u64 + offset, width);
+                let pxdata = Pixel {
+                    r: buf[idx],
+                    g: buf[idx],
+                    b: buf[idx],
+                };
+                self.bmpdata
+                    .lock()
+                    .unwrap()
+                    .borrow_mut()
+                    .set_pixel(px, py, pxdata);
+            }
+        } else {
+            for idx in 0..buf_len {
+                let adjusted_idx = idx as u64 + offset;
+                let total_dimensions = width * width;
+                let page = adjusted_idx / total_dimensions as u64;
+                let normalized_idx = adjusted_idx % total_dimensions as u64;
+                let (px, py) = twodee(normalized_idx, width);
+                let mut pxdata = self.bmpdata.lock().unwrap().borrow().get_pixel(px, py);
+                match page {
+                    0 => pxdata.r = buf[idx],
+                    1 => pxdata.g = buf[idx],
+                    2 => pxdata.b = buf[idx],
+                    _ => panic!("Page index out of range!"),
+                };
+                self.bmpdata
+                    .lock()
+                    .unwrap()
+                    .borrow_mut()
+                    .set_pixel(px, py, pxdata);
+            }
         }
 
         self.bmpdata
             .lock()
             .unwrap()
             .borrow()
-            .save(std::path::Path::new("/var/tmp/bmpdisk.bmp"))
+            .save(std::path::Path::new(&CONFIG.lock().unwrap().filename[..]))
             .unwrap();
 
         Ok(())
     }
 
-    fn can_write(&self) -> Result<bool> {
-        println!("Can write accessed.");
-        Ok(true)
+    fn config(key: &str, value: &str) -> Result<()>
+    where
+        Self: Sized,
+    {
+        match key {
+            "filename" => CONFIG.lock().unwrap().filename = value.to_string(),
+            "no-split-channels" => CONFIG.lock().unwrap().split_channels = false,
+            "dimensions" => {
+                CONFIG.lock().unwrap().dimensions = value.to_string().parse::<u32>().unwrap()
+            }
+            _ => {}
+        };
+        Ok(())
     }
 }
 
 plugin!(BMPDisk {
     write_at,
-    thread_model
+    thread_model,
+    config
 });
 
 #[cfg(test)]
@@ -118,6 +188,6 @@ mod tests {
         let bmpdisk = BMPDisk::open(false);
         let data: Vec<u8> = vec![0, 128, 0, 255];
 
-        bmpdisk.write_at(&data, 0, Flags::FUA).unwrap();
+        assert!(bmpdisk.write_at(&data, 0, Flags::FUA).is_ok());
     }
 }
