@@ -1,4 +1,5 @@
 use bmp::*;
+use fast_hilbert::*;
 use lazy_static::lazy_static;
 use nbdkit::*;
 use std::cell::RefCell;
@@ -21,17 +22,6 @@ lazy_static! {
         dimensions: 4096,
         split_channels: true
     });
-}
-
-pub fn onedee(x: u32, y: u32, width: u32) -> u64 {
-    (x + (y * width)) as u64
-}
-
-pub fn twodee(offset: u64, width: u32) -> (u32, u32) {
-    let x = (offset % (width as u64)) as u32;
-    let y = (offset / (width as u64)) as u32;
-
-    (x, y)
 }
 
 impl Server for BMPDisk {
@@ -85,7 +75,7 @@ impl Server for BMPDisk {
 
         if !CONFIG.lock().unwrap().split_channels {
             for idx in 0..buf_len {
-                let (px, py) = twodee(idx as u64 + offset, width);
+                let (px, py) = h2xy(idx as u64);
                 buf[idx] = self.bmpdata.lock().unwrap().borrow().get_pixel(px, py).r;
             }
         } else {
@@ -94,7 +84,7 @@ impl Server for BMPDisk {
                 let total_dimensions = width * width;
                 let page = adjusted_idx / total_dimensions as u64;
                 let normalized_idx = adjusted_idx % total_dimensions as u64;
-                let (px, py) = twodee(normalized_idx, width);
+                let (px, py) = h2xy(normalized_idx);
                 let pixel = self.bmpdata.lock().unwrap().borrow().get_pixel(px, py);
                 buf[idx] = match page {
                     0 => pixel.r,
@@ -114,7 +104,7 @@ impl Server for BMPDisk {
 
         if !CONFIG.lock().unwrap().split_channels {
             for idx in 0..buf_len {
-                let (px, py) = twodee(idx as u64 + offset, width);
+                let (px, py) = h2xy(idx as u64);
                 let pxdata = Pixel {
                     r: buf[idx],
                     g: buf[idx],
@@ -132,7 +122,7 @@ impl Server for BMPDisk {
                 let total_dimensions = width * width;
                 let page = adjusted_idx / total_dimensions as u64;
                 let normalized_idx = adjusted_idx % total_dimensions as u64;
-                let (px, py) = twodee(normalized_idx, width);
+                let (px, py) = h2xy(normalized_idx);
                 let mut pxdata = self.bmpdata.lock().unwrap().borrow().get_pixel(px, py);
                 match page {
                     0 => pxdata.r = buf[idx],
